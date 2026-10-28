@@ -1,3 +1,26 @@
+# DriveClub Recomp VR (unofficial fork)
+
+**Play the original DriveClub (PS4, 1.28) in a PC VR headset, through DriveClub Recomp.**
+This is not DriveClub VR: it is the full game with experimental VR added on top.
+
+- Cockpit view with 6DOF head tracking, stereo by alternate frames
+- The HUD as a panel in the car, menus on a screen in front of you
+- DLSS per eye (experimental)
+- Virtual Desktop, Meta Link and SteamVR (OpenXR)
+
+**Download:** [test builds on the Releases page](../../releases) · **Setup:** `VR QUICK START.txt` in the zip ([VR README](packaging/vr/README.md))
+
+**Videos:** [game window (left eye)](https://www.youtube.com/watch?v=bggpZ7TnL6A) · [recorded in the headset](https://www.youtube.com/watch?v=MXfFgH9S0eQ)
+
+Status: experimental test builds, tested on a Quest 2 (Virtual Desktop, Link, SteamVR) with an RTX 4070 Ti SUPER.
+VR is off by default; with it off the game runs as in the main project.
+
+Main project: [OverkillLabs3/driveclub-recomp](https://github.com/OverkillLabs3/driveclub-recomp) · VR draft PR: [#177](https://github.com/OverkillLabs3/driveclub-recomp/pull/177)
+
+---
+
+*The main project's README follows.*
+
 # DriveClub Recomp
 
 **DriveClub for PS4 (version 1.28), running natively on Windows.**
