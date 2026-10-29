@@ -35,8 +35,9 @@
 //                        game's field of view for it while on: SetFieldOfView; F5/F6 do not apply then)
 //   screen_vfov = 40     the height of the still screen, degrees
 //   runtime_fov = 1      the driver's head camera draws each eye with the field of view the runtime gives that eye
-//                        (often lopsided: wider outwards) and the eyes as far apart as the runtime says (ipd, when
-//                        set here, wins); 0: one symmetric field of view (cockpit_vfov) for both eyes
+//                        (often lopsided: wider outwards; drawn symmetric, each side as wide as the wider one) and the
+//                        eyes as far apart as the runtime says (ipd, when set here, wins); 0: one symmetric field of
+//                        view (cockpit_vfov) for both eyes
 //   screen_quad = 1      the still screen is a panel in the room (an OpenXR quad layer, screen_distance = 2 m
 //                        ahead); 0: a picture stated at the recentred head (some runtimes keep it on the face)
 //   latency_ms = 33      only for a frame whose camera was not found: the head pose of that long ago is stated
@@ -143,6 +144,9 @@ struct Settings {
     bool ipd_set = false; // ipd given in vr.ini
     float screen_distance = 2.0f;
     int reproject = 0;
+    // diagnostics, without a headset too: draw_trace = 1 (DrawTrace), hide_shader = <hex> ... (HiddenShader)
+    bool draw_trace = false;
+    uint64_t hidden[4]{};
     // recentre, seat up, down, left, right, forward, back: the number row (on every keyboard); the keypad works too
     // and the turn compensation, the reprojection, the DLSS model
     int keys[10] = {'0', '2', '1', '5', '6', '4', '3', '9', '8', '7'};
@@ -196,6 +200,8 @@ std::atomic<bool> active{false};
 // The eyes made from depth (reproject, key_reproject): 0 off, 1 the other eye from each alternate frame, 2 both eyes
 // from a frame drawn between them.
 std::atomic<int> reproject_mode{0};
+// draw_trace: the minus key moves the eyes' order by one frame (the next call draws the same eye again)
+std::atomic<int> eye_shifts{0};
 std::string instance_extension_storage, device_extension_storage;
 std::deque<std::string> extension_names;
 
@@ -318,6 +324,20 @@ void ReadSettings() {
             BbSettings::Get().dlss_model = c == 'k' ? 11 : c == 'l' ? 12 : c == 'm' ? 13 : 0;
             continue;
         }
+        // hide_shader = dc8e480a 44606ffd: draws with these vertex or pixel shaders are skipped (up to 4, hex)
+        char list[200] = "";
+        if (std::sscanf(line, " hide_shader = %199[^\r\n#]", list) == 1) {
+            char* at = list;
+            for (uint64_t& hash : settings.hidden) {
+                while (*at == ' ' || *at == ',' || *at == '\t') ++at;
+                char* end = at;
+                hash = std::strtoull(at, &end, 16);
+                if (end == at) break;
+                std::printf("VR: draws with shader %llx are hidden (hide_shader)\n", (unsigned long long)hash);
+                at = end;
+            }
+            continue;
+        }
         float value = 0;
         if (std::sscanf(line, " %63[a-z_] = %f", key, &value) != 2) {
             continue;
@@ -328,6 +348,7 @@ void ReadSettings() {
         else if (k == "smoothing") settings.smoothing = value != 0;
         else if (k == "auto_recentre") settings.auto_recentre = value != 0;
         else if (k == "diag") settings.diag = value != 0;
+        else if (k == "draw_trace") settings.draw_trace = value != 0;
         else if (k == "ipd" && value > 0.0f && value < 0.2f) settings.ipd = value, settings.ipd_set = true;
         else if (k == "runtime_fov") settings.runtime_fov = value != 0;
         else if (k == "seat_x") settings.seat[0] = value;
@@ -638,6 +659,7 @@ struct CameraState {
     float seat_point[3]{};
     long long seat_time_us = 0;
     int next_eye = 0;
+    int eye_shifts = 0; // the eye_shifts taken
     float diag_eye[3]{};
     long long diag_us = 0;
 };
@@ -766,6 +788,10 @@ extern "C" __attribute__((sysv_abi)) void bbvr_head_hook(float* camera) {
     // the left eye is on its + side).
     int eye = -1;
     if (settings.afr && reproject_mode.load(std::memory_order_relaxed) != 2) {
+        if (state.eye_shifts != eye_shifts.load(std::memory_order_relaxed)) {
+            state.eye_shifts = eye_shifts.load(std::memory_order_relaxed);
+            state.next_eye ^= 1; // the same eye as the last call: the order moves by one frame
+        }
         eye = state.next_eye;
         state.next_eye ^= 1;
         const float side = eye == 0 ? settings.ipd * 0.5f : -settings.ipd * 0.5f;
@@ -840,11 +866,52 @@ std::atomic<uint32_t> camera_copy_next{0};
 // The runtime's eyes (xrLocateViews, runtime_fov): each eye of the driver's head camera is drawn with its own field
 // of view, and the layer states it.
 std::mutex runtime_eye_mutex;
-XrFovf runtime_eye_fov[2]{};
+XrFovf runtime_eye_fov[2]{};   // drawn with: SymmetricFov of the runtime's
+XrFovf runtime_eye_exact[2]{}; // the runtime's own
 std::atomic<bool> runtime_eye_known{false};
 std::atomic<float> game_vfov{90.0f};         // the head camera's vertical angle the game is asked for (the FOV float)
 std::atomic<long long> eye_fov_us{0};        // the scene hook last drew the head camera with the runtime's eyes
 std::atomic<float> eye_x{0}, eye_y{0}, eye_z22{0}, eye_z32{0}; // that projection's terms
+
+// An eye's field of view made symmetric, each side as wide as its wider one: the game's shaders take the projection's
+// centre for the picture's (an off-centre one lost the power lines in the left eye, and things rebuilt from depth were
+// a little off). The layer gives the runtime just its own part of the picture (EyeCrop).
+XrFovf SymmetricFov(const XrFovf& f) {
+    const float x = std::max(-f.angleLeft, f.angleRight), y = std::max(f.angleUp, -f.angleDown);
+    return {-x, x, y, -y};
+}
+
+// The part of a picture of `eye` (drawn with SymmetricFov) that is the runtime's own field of view for it, in pixels of
+// a `width` x `height` picture (x, y, width, height), and that part's exact angles. Meta's runtime shows a picture at
+// its own angles whatever the layer states (the symmetric picture squinted there), so the layer gives it just these.
+bool EyeCrop(int eye, uint32_t width, uint32_t height, int32_t rect[4], XrFovf& out) {
+    if (eye < 0 || !settings.runtime_fov || !runtime_eye_known.load()) {
+        return false;
+    }
+    XrFovf drawn, exact;
+    {
+        std::scoped_lock lock{runtime_eye_mutex};
+        drawn = runtime_eye_fov[eye & 1], exact = runtime_eye_exact[eye & 1];
+    }
+    const float tx = std::tan(drawn.angleRight), ty = std::tan(drawn.angleUp);
+    if (tx <= 0.0f || ty <= 0.0f) {
+        return false;
+    }
+    // tangents across the picture: x from -tx (left edge) to tx, y from ty (top row) to -ty
+    const auto column = [&](float t) { return int32_t(std::lround((t + tx) / (2.0f * tx) * float(width))); };
+    const auto row = [&](float t) { return int32_t(std::lround((ty - t) / (2.0f * ty) * float(height))); };
+    const int32_t x0 = std::clamp(column(std::tan(exact.angleLeft)), 0, int32_t(width) - 1);
+    const int32_t x1 = std::clamp(column(std::tan(exact.angleRight)), x0 + 1, int32_t(width));
+    const int32_t y0 = std::clamp(row(std::tan(exact.angleUp)), 0, int32_t(height) - 1);
+    const int32_t y1 = std::clamp(row(std::tan(exact.angleDown)), y0 + 1, int32_t(height));
+    rect[0] = x0, rect[1] = y0, rect[2] = x1 - x0, rect[3] = y1 - y0;
+    // the angles of the whole pixels kept
+    out.angleLeft = std::atan(-tx + 2.0f * tx * float(x0) / float(width));
+    out.angleRight = std::atan(-tx + 2.0f * tx * float(x1) / float(width));
+    out.angleUp = std::atan(ty - 2.0f * ty * float(y0) / float(height));
+    out.angleDown = std::atan(ty - 2.0f * ty * float(y1) / float(height));
+    return true;
+}
 
 // Both eyes' fields of view together (the middle camera of reproject = 2).
 XrFovf UnionFov(const XrFovf& a, const XrFovf& b) {
@@ -1466,6 +1533,14 @@ void ReadKeys() {
         }
         was[k] = down;
     }
+    static bool was_shift = false;
+    const bool shift_down = settings.draw_trace && (GetAsyncKeyState(VK_OEM_MINUS) & 0x8000) != 0;
+    if (shift_down && !was_shift) {
+        const int shifts = ++eye_shifts;
+        std::printf("VR trace: the eyes' order moved by one frame (%d): each eye now gets the frames the other got\n",
+                    shifts);
+    }
+    was_shift = shift_down;
 #endif
 }
 
@@ -1652,6 +1727,22 @@ void NoteCameraConstants(const float* data) {
 // ---- the HUD apart -----------------------------------------------------------------------------------------------------
 bool HudLayer() {
     return Active() && settings.hud_layer && gpu.ready && gpu.hud_pipeline;
+}
+
+bool DrawTrace() {
+    return Wanted() && settings.draw_trace;
+}
+
+bool HiddenShader(uint64_t vs_hash, uint64_t ps_hash) {
+    if (!settings.hidden[0]) {
+        return false;
+    }
+    for (const uint64_t hash : settings.hidden) {
+        if (hash && (hash == vs_hash || hash == ps_hash)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool SceneOverlay(uint64_t vs_hash) {
@@ -2172,7 +2263,8 @@ void RecordFrame(VkCommandBuffer cmd, VkImage image, uint32_t width, uint32_t he
             st.eyes[0] = located[0], st.eyes[1] = located[1];
             {
                 std::scoped_lock lock{runtime_eye_mutex};
-                runtime_eye_fov[0] = located[0].fov, runtime_eye_fov[1] = located[1].fov;
+                runtime_eye_fov[0] = SymmetricFov(located[0].fov), runtime_eye_fov[1] = SymmetricFov(located[1].fov);
+                runtime_eye_exact[0] = located[0].fov, runtime_eye_exact[1] = located[1].fov;
             }
             runtime_eye_known = located[0].fov.angleRight > located[0].fov.angleLeft;
             const XrVector3f a = located[0].pose.position, b = located[1].pose.position;
@@ -2471,6 +2563,13 @@ void AfterSubmit() {
                 XrFovf own{};
                 if ((st.reproject_frame || st.afr_frame) && EyeFov(drawn, own)) {
                     v.fov = own;
+                    int32_t crop[4];
+                    if (EyeCrop(drawn, st.width, st.height, crop, own)) {
+                        v.fov = own; // just the runtime's own angles of the picture
+                        v.subImage.imageRect.offset.x += crop[0];
+                        v.subImage.imageRect.offset.y += crop[1];
+                        v.subImage.imageRect.extent = {crop[2], crop[3]};
+                    }
                 }
             }
             v.subImage.swapchain = st.swapchain;
