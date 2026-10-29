@@ -31,6 +31,8 @@
 //                        9/3)
 //   smoothing = 1        steadies a head that holds still ("1 euro" filter); smooth_hz = 0.5 (lower: steadier),
 //                        smooth_turn = 0.05 and smooth_move = 0.1 (how fast it lets go, per degree/s and per cm/s)
+//   frame_pose = 1       each frame is stated to the headset with the turn it was really drawn with (the game turns
+//                        the camera up to a few degrees after the hook: its view-projection's axes); 0: the hook's
 //   cockpit_vfov = 90    the driver's head camera's vertical field of view in the headset, degrees (VR sets the
 //                        game's field of view for it while on: SetFieldOfView; F5/F6 do not apply then)
 //   screen_vfov = 40     the height of the still screen, degrees
@@ -146,6 +148,8 @@ struct Settings {
     int reproject = 0;
     // diagnostics, without a headset too: draw_trace = 1 (DrawTrace), hide_shader = <hex> ... (HiddenShader)
     bool draw_trace = false;
+    // the head pose stated for a frame takes the turn the game gave the camera after the hook (frame_pose)
+    bool frame_pose = true;
     uint64_t hidden[4]{};
     // recentre, seat up, down, left, right, forward, back: the number row (on every keyboard); the keypad works too
     // and the turn compensation, the reprojection, the DLSS model
@@ -349,6 +353,7 @@ void ReadSettings() {
         else if (k == "auto_recentre") settings.auto_recentre = value != 0;
         else if (k == "diag") settings.diag = value != 0;
         else if (k == "draw_trace") settings.draw_trace = value != 0;
+        else if (k == "frame_pose") settings.frame_pose = value != 0;
         else if (k == "ipd" && value > 0.0f && value < 0.2f) settings.ipd = value, settings.ipd_set = true;
         else if (k == "runtime_fov") settings.runtime_fov = value != 0;
         else if (k == "seat_x") settings.seat[0] = value;
@@ -610,6 +615,8 @@ struct HookCall {
     int eye = -1;        // alternate frames: 0 the left eye, 1 the right, -1 the middle
     const float* camera = nullptr; // which driver's head camera
     float car[9]{};      // the frame the head turns in (the car body's axes as rows, world): the car's turn
+    float forward[3]{};  // the camera's z axis (world): with the position it names the frame's camera
+    float axes[9]{};     // the camera's axes as the hook set them (rows x, y, z; world)
 };
 HookCall head_history[64];
 std::atomic<int> drawing_eye{-1}; // the eye the head hook set the camera up for last
@@ -801,6 +808,9 @@ extern "C" __attribute__((sysv_abi)) void bbvr_head_hook(float* camera) {
     std::scoped_lock lock{head_mutex};
     HookCall& call = head_history[head_next++ % 64];
     call = {NowUs(), head, {cam[12], cam[13], cam[14]}, eye, camera};
+    for (int k = 0; k < 3; ++k) call.forward[k] = cam[8 + k];
+    for (int i = 0; i < 3; ++i)
+        for (int k = 0; k < 3; ++k) call.axes[i * 3 + k] = cam[i * 4 + k];
     drawing_eye = eye;
     for (int i = 0; i < 3; ++i)
         for (int k = 0; k < 3; ++k) call.car[i * 3 + k] = rest[i][k];
@@ -1700,9 +1710,24 @@ void NoteProjection(float x_scale, float y_scale, float z22, float z32) {
 
 std::atomic<bool> scene_drawn{false}; // a G-buffer pass since the last HUD split: a 3D scene this frame
 
+// How the frames' cameras were matched (logged every 30 s): frames, frames with several calls within 2 mm, and those
+// where the first of them in the ring (the old match) was not the best.
+struct MatchStats {
+    long long since_us = 0;
+    unsigned frames = 0, ambiguous = 0, first_wrong = 0;
+    float worst_deg = 0.0f;    // the old match's turn from the best one, the most seen
+    double frame_sum = 0.0;    // the frame's own turn from the hook's (degrees): sum, count, most
+    unsigned frame_count = 0;
+    float frame_most = 0.0f;
+} match_stats;
+
 void NoteCameraConstants(const float* data) {
     // Many draws bind 512 bytes (the mirror's and the reflections' cameras too): each is tried until one is a camera
-    // the hook gave the game (2 mm).
+    // the hook gave the game (2 mm). Several calls can be within 2 mm of it: a head turning about its own middle
+    // hardly moves, so the turn decides too. The constants' view-projection (floats 0-15, column-major) has the
+    // camera's z axis as its w row (floats 3, 7, 11); the best match is the one turned most alike, the newest of
+    // equals. (The first within 2 mm, as before, could be a call from up to half a second back with another turn:
+    // the headset was told the wrong pose and the picture jumped when the next frame came.)
     if (!Active()) {
         return;
     }
@@ -1711,16 +1736,130 @@ void NoteCameraConstants(const float* data) {
     if (camera_now.found) {
         return;
     }
+    const float wl = std::sqrt(data[3] * data[3] + data[7] * data[7] + data[11] * data[11]);
+    const bool have_w = wl > 1e-6f && std::isfinite(wl);
     std::scoped_lock head_lock{head_mutex};
+    const HookCall* best = nullptr;
+    const HookCall* first = nullptr;
+    float best_score = 0.0f;
+    unsigned close_calls = 0;
+    const auto score_of = [&](const HookCall& c) {
+        if (!have_w) {
+            return 0.0f;
+        }
+        const float fl = std::sqrt(c.forward[0] * c.forward[0] + c.forward[1] * c.forward[1] +
+                                   c.forward[2] * c.forward[2]);
+        const float dot = (data[3] * c.forward[0] + data[7] * c.forward[1] + data[11] * c.forward[2]) /
+                          (wl * std::fmax(fl, 1e-6f));
+        return 1.0f - std::fabs(dot); // 0: the same direction
+    };
     for (const HookCall& c : head_history) {
         const float dx = data[108] - c.position[0], dy = data[109] - c.position[1], dz = data[110] - c.position[2];
-        if (c.time_us && dx * dx + dy * dy + dz * dz < 0.002f * 0.002f) {
-            camera_now = {true, c.eye, c.head};
-            std::memcpy(camera_now.car, c.car, sizeof c.car);
-            drawn_camera = c.camera;
-            drawn_camera_us = NowUs();
-            return;
+        if (!c.time_us || dx * dx + dy * dy + dz * dz >= 0.002f * 0.002f) {
+            continue;
         }
+        ++close_calls;
+        if (!first) {
+            first = &c;
+        }
+        const float score = score_of(c);
+        if (!best || score < best_score - 1e-7f || (score <= best_score + 1e-7f && c.time_us > best->time_us)) {
+            best = &c;
+            best_score = score;
+        }
+    }
+    if (!best) {
+        return;
+    }
+    camera_now = {true, best->eye, best->head};
+    std::memcpy(camera_now.car, best->car, sizeof best->car);
+    // The frame's own camera axes: its view-projection's rows x, y and w are P00 x + P20 z, P11 y + P21 z and z (the
+    // view's rows, world); made orthonormal, each signed like the hook's. The turn from the hook's axes to them, in
+    // the camera's own axes (the game turns the camera a little after the hook: 1-4 degrees seen), is put on the
+    // stated head (the camera's x and z are the headset's -x and -z), so the headset turns the picture by what it
+    // was really drawn with.
+    float frame_deg = -1.0f;
+    if (have_w) {
+        float b[3][3];
+        const float rows[3][3] = {{data[0], data[4], data[8]}, {data[1], data[5], data[9]}, {data[3], data[7], data[11]}};
+        const auto dot3 = [](const float* u, const float* v) { return u[0] * v[0] + u[1] * v[1] + u[2] * v[2]; };
+        const auto unit = [&](float* v) {
+            const float l = std::sqrt(dot3(v, v));
+            if (!(l > 1e-6f)) return false;
+            for (int k = 0; k < 3; ++k) v[k] /= l;
+            return true;
+        };
+        bool ok = true;
+        for (int k = 0; k < 3; ++k) b[2][k] = rows[2][k];
+        ok = ok && unit(b[2]);
+        // x without z, then y without z and x (Gram-Schmidt)
+        for (int i = 0; i < 2 && ok; ++i) {
+            for (int k = 0; k < 3; ++k) b[i][k] = rows[i][k];
+            for (const int j : {2, 0}) {
+                if (j == i || (i == 0 && j == 0)) continue;
+                const float d = dot3(b[i], b[j]);
+                for (int k = 0; k < 3; ++k) b[i][k] -= d * b[j][k];
+            }
+            ok = ok && unit(b[i]);
+        }
+        if (ok) {
+            // signed like the hook's axes
+            for (int i = 0; i < 3; ++i) {
+                if (dot3(b[i], best->axes + i * 3) < 0.0f) {
+                    for (int k = 0; k < 3; ++k) b[i][k] = -b[i][k];
+                }
+            }
+            // q[i][j] = hook axis i . frame axis j, the headset's axes (x and z flipped)
+            static const float flip[3] = {-1.0f, 1.0f, -1.0f};
+            float q[3][3];
+            for (int i = 0; i < 3; ++i)
+                for (int j = 0; j < 3; ++j) q[i][j] = flip[i] * flip[j] * dot3(best->axes + i * 3, b[j]);
+            Quat t;
+            const float trace = q[0][0] + q[1][1] + q[2][2];
+            if (trace > 0.0f) {
+                const float r = std::sqrt(1.0f + trace) * 2.0f;
+                t = {(q[2][1] - q[1][2]) / r, (q[0][2] - q[2][0]) / r, (q[1][0] - q[0][1]) / r, 0.25f * r};
+                const float n = std::sqrt(t.x * t.x + t.y * t.y + t.z * t.z + t.w * t.w);
+                t = {t.x / n, t.y / n, t.z / n, t.w / n};
+                frame_deg = 2.0f * std::acos(std::fmin(1.0f, std::fabs(t.w))) * 180.0f / Pi;
+                if (settings.frame_pose && frame_deg < 10.0f) {
+                    const Quat h = Mul(ToQuat(camera_now.head.orientation), t);
+                    camera_now.head.orientation = {h.x, h.y, h.z, h.w};
+                }
+            }
+        }
+    }
+    drawn_camera = best->camera;
+    drawn_camera_us = NowUs();
+    // the log
+    MatchStats& m = match_stats;
+    const long long now = NowUs();
+    if (!m.since_us) {
+        m.since_us = now;
+    }
+    ++m.frames;
+    if (frame_deg >= 0.0f) {
+        m.frame_sum += frame_deg;
+        ++m.frame_count;
+        m.frame_most = std::fmax(m.frame_most, frame_deg);
+    }
+    if (close_calls > 1) {
+        ++m.ambiguous;
+    }
+    if (first != best) {
+        ++m.first_wrong;
+        const float deg = AngleDeg(first->head.orientation, best->head.orientation);
+        m.worst_deg = std::fmax(m.worst_deg, deg);
+    }
+    if (now - m.since_us > 30000000) {
+        std::printf("VR: frame cameras over 30 s: %u frames, %u matched among several calls within 2 mm (the "
+                    "first of them, the old match, %u times another call, up to %.1f degrees off); the game turned "
+                    "the camera after the hook by %.2f degrees on average, %.2f the most%s\n",
+                    m.frames, m.ambiguous, m.first_wrong, m.worst_deg,
+                    m.frame_count ? float(m.frame_sum / m.frame_count) : 0.0f, m.frame_most,
+                    !have_w ? " (no view direction in the constants)"
+                    : settings.frame_pose ? "" : " (not stated: frame_pose = 0)");
+        m = {now, 0, 0, 0, 0.0f, 0.0, 0, 0.0f};
     }
 }
 
