@@ -22,6 +22,8 @@ extern std::mutex* g_queue_mutex;
 bool Wanted();
 /// A headset session exists: the per-frame entry points have work to do.
 bool Active();
+/// The headset's refresh rate (from its frame timing), 0 before its first frame or without a headset.
+uint32_t HeadsetHz();
 
 /// Before vkCreateInstance: starts OpenXR and adds the instance extensions its runtime needs.
 void AppendInstanceExtensions(std::vector<const char*>& extensions);
@@ -58,8 +60,9 @@ bool DrawTrace();
 bool HiddenShader(uint64_t vs_hash, uint64_t ps_hash);
 bool SceneDrawn();
 /// `depth` (TRANSFER_SRC_OPTIMAL, stays so; may be null): the frame's scene depth, for reproject.
+/// `stereo`: the display buffer has the right eye in layer 1 (multiview): it is copied out too.
 void TakeScene(VkCommandBuffer cmd, VkImage display, VkFormat format, uint32_t width, uint32_t height, VkImage depth,
-               VkFormat depth_format, uint32_t depth_width, uint32_t depth_height);
+               VkFormat depth_format, uint32_t depth_width, uint32_t depth_height, bool stereo = false);
 /// A presenter frame was made from the game's display buffer (`display_view`: SHADER_READ_ONLY_OPTIMAL, in
 /// `display_format`, at the output resolution; null for HDR): the headset gets that picture, with the frame's camera.
 /// `alpha_view`: the same with its alpha (the window's view makes it one), for the HUD's coverage.

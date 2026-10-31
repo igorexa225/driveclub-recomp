@@ -18,6 +18,7 @@
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
+#include "video_core/renderer_vulkan/vr/vr_multiview.h" // VR multiview
 
 #include <vk_mem_alloc.h>
 
@@ -337,7 +338,8 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
             .depth = info.size.depth,
         },
         .mipLevels = static_cast<u32>(info.resources.levels),
-        .arrayLayers = static_cast<u32>(info.resources.layers),
+        // VR multiview: main-view images get a second layer, the right eye (vr_multiview.h)
+        .arrayLayers = Vulkan::Vr::Multiview::BackingLayers(info, static_cast<u32>(info.resources.layers)),
         .samples = LiverpoolToVK::NumSamples(info.num_samples, supported_samples),
         .tiling = tiling,
         .usage = usage_flags,
@@ -418,8 +420,7 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
                (fewer && !stages_cover(state.pl_stage, dst_stage));
     };
     // BB_FEWER_BARRIERS=1, whole images only: a read after reads in the same layout needs no barrier when an earlier
-    // barrier already made the image visible to that kind of access (every kind the image was read with since its
-    // last write is kept in its access mask); its stage joins the image's for the next barrier. On NVIDIA every
+    // barrier already made the image visible to that kind of access and stage. On NVIDIA every
     // barrier call costs the same whatever it holds, so only skipping one saves anything.
     constexpr auto any_write = write_flags | vk::AccessFlagBits2::eColorAttachmentWrite |
                                vk::AccessFlagBits2::eDepthStencilAttachmentWrite;
@@ -429,7 +430,6 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
     const auto read_merge = [&](const State& state) {
         return reads_only(state) && !(dst_mask & ~state.access_mask) && stages_cover(state.pl_stage, dst_stage);
     };
-    bool full_path = false;
     const auto transition = [&](State& state, u32 mip, u32 layer) {
         // NOTE: this may produce a lot of small barriers.
         // If this becomes a problem, we can optimize it by merging adjacent barriers.
@@ -448,7 +448,7 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
                 .baseMipLevel = mip,
                 .levelCount = 1,
                 .baseArrayLayer = layer,
-                .layerCount = 1,
+                .layerCount = Vulkan::Vr::Multiview::Stereo(*this) ? 2u : 1u, // VR multiview: both eyes
             },
         });
         state.layout = dst_layout;
@@ -566,7 +566,6 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
             last_state.pl_stage |= dst_stage;
             return;
         }
-        full_path = true;
 
         barriers.emplace_back(vk::ImageMemoryBarrier2{
             .srcStageMask = last_state.pl_stage,
@@ -588,10 +587,8 @@ void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::Acce
         });
     }
 
-    // A read-only barrier between reads leaves the image visible to the kinds of read it already was.
-    const bool keep_reads = full_path && reads_only(last_state);
     last_state.layout = dst_layout;
-    last_state.access_mask = keep_reads ? last_state.access_mask | dst_mask : dst_mask;
+    last_state.access_mask = dst_mask;
     last_state.pl_stage = dst_stage;
 }
 
