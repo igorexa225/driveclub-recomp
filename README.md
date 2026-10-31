@@ -7,13 +7,13 @@ This is not DriveClub VR: it is the full game with experimental VR added on top.
 - True stereo (both eyes in every frame) or AFR (alternate frames), picked in the launcher
 - The HUD as a panel in the car, menus on a screen in front of you
 - DLSS per eye in both modes (experimental)
-- Virtual Desktop, Meta Link and SteamVR (OpenXR)
+- Virtual Desktop and SteamVR (OpenXR); Meta Link judders in True stereo
 
 **Download:** [test builds on the Releases page](../../releases) · **Setup:** `VR QUICK START.txt` in the zip ([VR README](packaging/vr/README.md))
 
 **Videos:** [game window (left eye)](https://www.youtube.com/watch?v=bggpZ7TnL6A) · [recorded in the headset](https://www.youtube.com/watch?v=MXfFgH9S0eQ)
 
-Status: experimental test builds, tested on a Quest 2 with an RTX 4070 Ti SUPER (the latest build on Virtual Desktop; earlier ones also on Link and SteamVR).
+Status: experimental test builds, tested on a Quest 2 with an RTX 4070 Ti SUPER (Virtual Desktop and SteamVR).
 VR is off by default; with it off the game runs as in the main project.
 
 Main project: [OverkillLabs3/driveclub-recomp](https://github.com/OverkillLabs3/driveclub-recomp) · VR draft PR: [#177](https://github.com/OverkillLabs3/driveclub-recomp/pull/177)
